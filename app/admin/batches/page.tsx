@@ -1,4 +1,5 @@
 import { assignDroneToBatch, releaseDroneFromBatch, updateBatchStatus } from '@/app/admin/actions';
+import { AdminAutoRefresh } from '@/components/admin/auto-refresh';
 import { AdminOperationsMap } from '@/components/maps/admin-operations-map';
 import { fetchAdminOverview } from '@/lib/admin-ops';
 import { formatLocalDateTime } from '@/lib/time';
@@ -41,6 +42,7 @@ export default async function BatchesPage(props: { searchParams?: Promise<Record
 
   return (
     <div className="min-h-full">
+      <AdminAutoRefresh intervalMs={3000} />
       {/* Header */}
       <div className="border-b border-slate-800/40 bg-[#070b14]">
         <div className="max-w-7xl mx-auto px-6 py-8 flex items-end justify-between gap-4 flex-wrap">
@@ -122,7 +124,7 @@ export default async function BatchesPage(props: { searchParams?: Promise<Record
 
                 <div className="space-y-6 p-5">
                   {/* Map */}
-                  <AdminOperationsMap selectedBatch={selectedBatch} markers={overview.mapMarkers} zones={overview.zones} />
+                  <AdminOperationsMap selectedBatch={selectedBatch} zones={overview.zones} />
 
                   {/* Info + Controls */}
                   <div className="grid gap-4 md:grid-cols-2">

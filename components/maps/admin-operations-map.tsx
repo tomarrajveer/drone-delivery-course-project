@@ -1,25 +1,32 @@
 'use client';
 
 import { OsmMap } from '@/components/maps/osm-map';
-import type { AdminBatchSummary, AdminMapMarker, AdminMapZone } from '@/lib/admin-ops';
+import type { AdminBatchSummary, AdminMapZone } from '@/lib/admin-ops';
 
 interface AdminOperationsMapProps {
   selectedBatch: AdminBatchSummary | null;
-  markers: AdminMapMarker[];
   zones: AdminMapZone[];
 }
 
-export function AdminOperationsMap({ selectedBatch, markers, zones }: AdminOperationsMapProps) {
+export function AdminOperationsMap({ selectedBatch, zones }: AdminOperationsMapProps) {
   return (
     <div className="space-y-3">
       <div className="text-sm text-slate-400">
-        {selectedBatch ? `All markers shown. Highlighted route belongs to Batch #${selectedBatch.batchId}.` : 'All hubs, drones, sellers, orders, and zones are shown here.'}
+        {selectedBatch
+          ? `Focused live view for Batch #${selectedBatch.batchId}. Only the batch hub, active sellers, remaining stops, and assigned drone are shown.`
+          : 'Select a batch to inspect its live route.'}
       </div>
       <OsmMap
-        center={zones[0]?.center ?? markers[0]?.position ?? null}
+        center={selectedBatch?.route[0] ?? zones[0]?.center ?? null}
         zones={zones.map((zone) => ({ zoneId: zone.zoneId, label: zone.label, center: zone.center, radiusMeters: zone.radiusMeters, boundaryRef: zone.boundaryRef, vertices: zone.vertices }))}
-        markers={markers}
+        markers={selectedBatch?.mapMarkers ?? []}
         route={selectedBatch?.route ?? []}
+        segments={selectedBatch?.segments ?? []}
+        fitPoints={[
+          ...(selectedBatch?.mapMarkers.map((marker) => marker.position) ?? []),
+          ...(selectedBatch?.segments.flatMap((segment) => segment.points) ?? []),
+        ]}
+        fitKey={selectedBatch?.batchId ?? 'admin-batch-map'}
         height={420}
       />
     </div>

@@ -1,5 +1,6 @@
 import Link from 'next/link';
 import { fetchAdminOverview } from '@/lib/admin-ops';
+import { AdminAutoRefresh } from '@/components/admin/auto-refresh';
 import { AdminOverviewMap } from '@/components/maps/admin-overview-map';
 
 function statusTone(status: string) {
@@ -37,10 +38,10 @@ export default async function AdminOverviewPage() {
   ];
 
   const recentBatches = overview.batches.slice(0, 5);
-  const activeDrones = overview.drones.filter((d) => d.status.toLowerCase() !== 'available');
 
   return (
     <div className="min-h-full">
+      <AdminAutoRefresh intervalMs={3000} />
       {/* Header */}
       <div className="border-b border-slate-800/40 bg-[#070b14]">
         <div className="max-w-7xl mx-auto px-6 py-8 flex items-end justify-between gap-4 flex-wrap">
@@ -91,7 +92,7 @@ export default async function AdminOverviewPage() {
           <div className="px-5 py-4 border-b border-slate-800/40 flex items-center justify-between">
             <div>
               <h2 className="text-sm font-semibold text-slate-100">Live Operations Map</h2>
-              <p className="text-xs text-slate-500 mt-0.5">All zones, hubs, drones, orders, and sellers</p>
+              <p className="text-xs text-slate-500 mt-0.5">All zones, hubs, drones, sellers, and only live orders</p>
             </div>
           </div>
           <div className="p-1">

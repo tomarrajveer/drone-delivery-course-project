@@ -1,6 +1,6 @@
 import 'server-only';
 
-import { deriveZoneShape, parseHexZoneBoundary, parsePoint, type LatLngPoint } from '@/lib/geo';
+import { bearingBetweenDegrees, deriveZoneShape, parseHexZoneBoundary, parsePoint, type LatLngPoint } from '@/lib/geo';
 import { getSupabaseAdminClient } from '@/lib/supabase/admin';
 
 interface BatchRow {
@@ -87,6 +87,17 @@ export interface AdminMapMarker {
   position: LatLngPoint;
   color: string;
   detail?: string;
+  rotationDegrees?: number;
+}
+
+export interface AdminMapSegment {
+  id: string;
+  points: LatLngPoint[];
+  color?: string;
+  weight?: number;
+  dashed?: boolean;
+  label?: string;
+  detail?: string;
 }
 
 export interface AdminMapZone {
@@ -129,6 +140,8 @@ export interface AdminBatchSummary {
   totalWeight: number;
   activeOrderCount: number;
   route: LatLngPoint[];
+  mapMarkers: AdminMapMarker[];
+  segments: AdminMapSegment[];
   orders: AdminBatchOrder[];
 }
 
@@ -165,6 +178,10 @@ export interface AdminOverview {
 
 function normalizeStatus(value: string | null | undefined, fallback: string) {
   return value?.trim() || fallback;
+}
+
+function isClosedOrderStatus(status: string | null | undefined) {
+  return ['delivered', 'completed', 'failed', 'cancelled'].includes(normalizeStatus(status, '').toLowerCase());
 }
 
 function droneLabel(droneId: number, model?: ModelRow | null) {
@@ -248,6 +265,14 @@ export async function fetchAdminOverview(): Promise<AdminOverview> {
       };
     })
     .filter((hub): hub is NonNullable<typeof hub> => Boolean(hub));
+  const sellerSummaryMap = new Map(sellerSummaries.map((seller) => [seller.sellerId, seller]));
+  const hubByZone = new Map(hubSummaries.map((hub) => [hub.zoneId, hub]));
+  const stopsByBatch = new Map<number, BatchStopRow[]>();
+  for (const stop of stops) {
+    const stopList = stopsByBatch.get(stop.batch_id) ?? [];
+    stopList.push(stop);
+    stopsByBatch.set(stop.batch_id, stopList);
+  }
 
   const batchOrdersMap = new Map<number, AdminBatchOrder[]>();
   for (const order of orders) {
@@ -337,7 +362,7 @@ export async function fetchAdminOverview(): Promise<AdminOverview> {
     const currentHub = drone.current_hub_id ? hubSummaries.find((hub) => hub.hubId === drone.current_hub_id) ?? null : null;
     const routeOrders = assignedBatch ? batchOrdersMap.get(assignedBatch.batch_id) ?? [] : [];
     const firstPendingRoutePoint = routeOrders
-      .filter((order) => !['delivered', 'completed', 'failed', 'cancelled'].includes(order.status.toLowerCase()))
+      .filter((order) => !isClosedOrderStatus(order.status))
       .map(positionFromOrder)
       .find((point): point is LatLngPoint => Boolean(point)) ?? null;
 
@@ -369,9 +394,73 @@ export async function fetchAdminOverview(): Promise<AdminOverview> {
   const batchSummaries: AdminBatchSummary[] = batches.map((batch) => {
     const ordersForBatch = batchOrdersMap.get(batch.batch_id) ?? [];
     const drone = batch.drone_id ? droneMap.get(batch.drone_id) ?? null : null;
-    const route = ordersForBatch
+    const zoneHub = batch.zone_id ? hubByZone.get(batch.zone_id) ?? null : null;
+    const activeOrders = ordersForBatch.filter((order) => !isClosedOrderStatus(order.status));
+    const activeRoute = activeOrders
       .map(positionFromOrder)
       .filter((point): point is LatLngPoint => Boolean(point));
+    const route = [
+      ...(drone?.position ? [drone.position] : zoneHub?.position ? [zoneHub.position] : []),
+      ...activeRoute,
+    ];
+    const nextRoutePoint = activeRoute[0] ?? zoneHub?.position ?? null;
+    const droneHeading = drone?.position && nextRoutePoint ? bearingBetweenDegrees(drone.position, nextRoutePoint) : undefined;
+    const liveSellerMarkers = activeOrders
+      .map((order) => {
+        const seller = sellerSummaryMap.get(order.sellerId);
+        if (!seller?.position) return null;
+        return {
+          id: `batch-${batch.batch_id}-seller-${seller.sellerId}`,
+          label: seller.name,
+          kind: 'seller' as const,
+          position: seller.position,
+          color: '#f59e0b',
+          detail: seller.email,
+        };
+      })
+      .filter((marker): marker is NonNullable<typeof marker> => Boolean(marker));
+    const liveOrderMarkers = activeOrders
+      .map((order) => {
+        const point = positionFromOrder(order);
+        if (!point) return null;
+        return {
+          id: `batch-${batch.batch_id}-order-${order.orderId}`,
+          label: `ORD-${order.orderId}`,
+          kind: 'order' as const,
+          position: point,
+          color: '#22c55e',
+          detail: order.status,
+        };
+      })
+      .filter((marker): marker is NonNullable<typeof marker> => Boolean(marker));
+    const batchMarkers: AdminMapMarker[] = [
+      ...(zoneHub ? [{
+        id: `batch-${batch.batch_id}-hub-${zoneHub.hubId}`,
+        label: zoneHub.label,
+        kind: 'hub' as const,
+        position: zoneHub.position,
+        color: '#38bdf8',
+        detail: `Zone ${zoneHub.zoneId}`,
+      }] : []),
+      ...liveSellerMarkers,
+      ...liveOrderMarkers,
+      ...(drone?.position ? [{
+        id: `batch-${batch.batch_id}-drone-${drone.droneId}`,
+        label: drone.label,
+        kind: 'drone' as const,
+        position: drone.position,
+        color: '#2563eb',
+        detail: drone.assignedBatchId ? `Batch #${drone.assignedBatchId} · ${drone.status}` : drone.status,
+        rotationDegrees: droneHeading,
+      }] : []),
+    ];
+    const segments: AdminMapSegment[] = route.length > 1 ? [{
+      id: `batch-${batch.batch_id}-route`,
+      points: route,
+      color: '#60a5fa',
+      weight: 4,
+      detail: activeOrders.length > 0 ? 'Remaining live route' : 'Drone returning to hub',
+    }] : [];
 
     return {
       batchId: batch.batch_id,
@@ -386,8 +475,10 @@ export async function fetchAdminOverview(): Promise<AdminOverview> {
       updatedAt: batch.updated_at,
       orderCount: ordersForBatch.length,
       totalWeight: Math.round(ordersForBatch.reduce((sum, order) => sum + order.weight, 0) * 100) / 100,
-      activeOrderCount: ordersForBatch.filter((order) => !['delivered', 'completed', 'failed', 'cancelled'].includes(order.status.toLowerCase())).length,
+      activeOrderCount: activeOrders.length,
       route,
+      mapMarkers: batchMarkers,
+      segments,
       orders: ordersForBatch,
     };
   });
@@ -413,6 +504,7 @@ export async function fetchAdminOverview(): Promise<AdminOverview> {
     }));
 
   const orderMarkers: AdminMapMarker[] = orders.reduce<AdminMapMarker[]>((acc, order) => {
+    if (isClosedOrderStatus(order.status)) return acc;
     const point = parsePoint(order.drop_location);
     if (!point) return acc;
 
@@ -428,16 +520,27 @@ export async function fetchAdminOverview(): Promise<AdminOverview> {
     return acc;
   }, []);
 
+  const batchSummaryMap = new Map(batchSummaries.map((batch) => [batch.batchId, batch]));
+
   const droneMarkers: AdminMapMarker[] = droneSummaries
     .filter((drone) => drone.position)
-    .map((drone) => ({
-      id: `drone-${drone.droneId}`,
-      label: drone.label,
-      kind: 'drone',
-      position: drone.position as LatLngPoint,
-      color: '#8b5cf6',
-      detail: drone.assignedBatchId ? `Batch #${drone.assignedBatchId} · ${drone.status}` : drone.status,
-    }));
+    .map((drone) => {
+      const batch = drone.assignedBatchId ? batchSummaryMap.get(drone.assignedBatchId) ?? null : null;
+      const nextPoint = batch?.route.length && drone.position
+        ? batch.route.find((point, index) => index > 0 && (point.lat !== drone.position?.lat || point.lng !== drone.position?.lng)) ?? null
+        : null;
+      const heading = drone.position && nextPoint ? bearingBetweenDegrees(drone.position, nextPoint) : undefined;
+
+      return {
+        id: `drone-${drone.droneId}`,
+        label: drone.label,
+        kind: 'drone' as const,
+        position: drone.position as LatLngPoint,
+        color: '#2563eb',
+        detail: drone.assignedBatchId ? `Batch #${drone.assignedBatchId} · ${drone.status}` : drone.status,
+        rotationDegrees: heading,
+      };
+    });
 
   const mapMarkers: AdminMapMarker[] = [...hubMarkers, ...sellerMarkers, ...orderMarkers, ...droneMarkers];
 

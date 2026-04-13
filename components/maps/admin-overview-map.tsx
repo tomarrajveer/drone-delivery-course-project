@@ -22,6 +22,7 @@ export function AdminOverviewMap({ markers, zones }: AdminOverviewMapProps) {
       }))}
       markers={markers}
       route={[]}
+      fitKey="admin-overview-map"
       height={480}
     />
   );

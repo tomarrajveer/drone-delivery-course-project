@@ -8,6 +8,7 @@ import { OsmMap } from '@/components/maps/osm-map';
 import { formatLocalDateTime } from '@/lib/time';
 
 const CLOSED_STATUSES = new Set(['completed', 'delivered', 'cancelled', 'failed']);
+const LIVE_REFRESH_MS = 3000;
 
 function formatDateTime(value: string | null) {
   return formatLocalDateTime(value, 'Pending');
@@ -64,7 +65,7 @@ export default function CurrentDeliveriesPage() {
     };
 
     void load();
-    timer = setInterval(() => void load(), 15000);
+    timer = setInterval(() => void load(), LIVE_REFRESH_MS);
 
     return () => {
       active = false;
@@ -74,13 +75,19 @@ export default function CurrentDeliveriesPage() {
 
   useEffect(() => {
     let active = true;
+    let timer: ReturnType<typeof setInterval> | null = null;
+
     const loadMap = async () => {
-      if (!selectedDelivery?.batchId) {
+      if (!selectedDelivery?.batchId || !user?.sellerId) {
         setSelectedMap(null);
         return;
       }
       try {
-        const snapshot = await fetchSellerBatchMap(selectedDelivery.batchId);
+        const snapshot = await fetchSellerBatchMap({
+          batchId: selectedDelivery.batchId,
+          sellerId: user.sellerId,
+          orderId: selectedDelivery.orderId,
+        });
         if (active) setSelectedMap(snapshot);
       } catch (error) {
         console.error('Unable to load map data', error);
@@ -88,8 +95,12 @@ export default function CurrentDeliveriesPage() {
     };
 
     void loadMap();
-    return () => { active = false; };
-  }, [selectedDelivery?.batchId, selectedDelivery?.status, selectedDelivery?.droneId]);
+    timer = setInterval(() => void loadMap(), LIVE_REFRESH_MS);
+    return () => {
+      active = false;
+      if (timer) clearInterval(timer);
+    };
+  }, [selectedDelivery?.batchId, selectedDelivery?.orderId, selectedDelivery?.status, selectedDelivery?.droneId, user?.sellerId]);
 
   const deliveries = useMemo(
     () => allDeliveries.filter((d) => !CLOSED_STATUSES.has(d.status.toLowerCase())),
@@ -232,7 +243,7 @@ export default function CurrentDeliveriesPage() {
 
                   <p className="text-[11px] text-slate-600 mt-4 flex items-center gap-1.5">
                     <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                    Updates every 15 seconds
+                    Updates every 3 seconds
                   </p>
                 </div>
 
@@ -241,7 +252,13 @@ export default function CurrentDeliveriesPage() {
                     center={selectedMap?.zone?.center ?? { lat: selectedDelivery.destinationLat, lng: selectedDelivery.destinationLng }}
                     zones={selectedMap?.zone ? [{ zoneId: selectedDelivery.batchId ?? 0, label: selectedMap.zone.label, center: selectedMap.zone.center, radiusMeters: selectedMap.zone.radiusMeters, vertices: selectedMap.zone.vertices }] : []}
                     markers={selectedMap?.markers ?? [{ id: `order-${selectedDelivery.orderId}`, label: `ORD-${selectedDelivery.orderId}`, kind: 'destination', color: '#22c55e', position: { lat: selectedDelivery.destinationLat, lng: selectedDelivery.destinationLng } }]}
-                    route={selectedMap?.route ?? [{ lat: selectedDelivery.destinationLat, lng: selectedDelivery.destinationLng }]}
+                    route={selectedMap?.route ?? []}
+                    segments={selectedMap?.segments ?? []}
+                    fitPoints={[
+                      ...(selectedMap?.markers?.map((marker) => marker.position) ?? [{ lat: selectedDelivery.destinationLat, lng: selectedDelivery.destinationLng }]),
+                      ...(selectedMap?.segments?.flatMap((segment) => segment.points) ?? []),
+                    ]}
+                    fitKey={selectedDelivery.orderId}
                     height={420}
                   />
                 </div>

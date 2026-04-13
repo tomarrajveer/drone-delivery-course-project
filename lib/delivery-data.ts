@@ -1,5 +1,5 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { deriveZoneShape, parseHexZoneBoundary, parsePoint, toPointValue, type LatLngPoint } from '@/lib/geo';
+import { bearingBetweenDegrees, deriveZoneShape, distanceBetweenMeters, parseHexZoneBoundary, parsePoint, toPointValue, type LatLngPoint } from '@/lib/geo';
 import { getSupabaseBrowserClient } from '@/lib/supabase/client';
 import { toCanonicalIso } from '@/lib/time';
 
@@ -21,8 +21,18 @@ export interface SellerMapSnapshot {
     color: string;
     position: LatLngPoint;
     detail?: string;
+    rotationDegrees?: number;
   }>;
   route: LatLngPoint[];
+  segments: Array<{
+    id: string;
+    points: LatLngPoint[];
+    color?: string;
+    weight?: number;
+    dashed?: boolean;
+    label?: string;
+    detail?: string;
+  }>;
 }
 
 export interface SellerDelivery {
@@ -453,13 +463,16 @@ export async function fetchSellerDeliveries(sellerId: number, client?: SupabaseC
   return fetchSellerDeliveryRecords(sellerId, client);
 }
 
-export async function fetchSellerBatchMap(batchId: number, client?: SupabaseClient): Promise<SellerMapSnapshot | null> {
+export async function fetchSellerBatchMap(
+  input: { batchId: number; sellerId: number; orderId: number },
+  client?: SupabaseClient
+): Promise<SellerMapSnapshot | null> {
   const supabase = getClient(client);
 
   const { data: batchData, error: batchError } = await supabase
     .from('delivery_batches')
     .select('batch_id, zone_id, drone_id, status')
-    .eq('batch_id', batchId)
+    .eq('batch_id', input.batchId)
     .maybeSingle();
 
   if (batchError) throw new Error(batchError.message);
@@ -467,12 +480,12 @@ export async function fetchSellerBatchMap(batchId: number, client?: SupabaseClie
 
   const batch = batchData as { batch_id: number; zone_id: number | null; drone_id: number | null; status: string | null };
 
-  const [ordersResult, hubLocationsResult, sellersResult, storeLocationsResult, droneResult, zoneResult] = await Promise.all([
-    supabase.from('orders').select('order_id, seller_id, drop_location, status').eq('batch_id', batchId).order('order_id', { ascending: true }),
+  const [orderResult, hubLocationsResult, sellerResult, storeLocationsResult, droneResult, zoneResult] = await Promise.all([
+    supabase.from('orders').select('order_id, seller_id, drop_location, status').eq('order_id', input.orderId).eq('seller_id', input.sellerId).eq('batch_id', input.batchId).maybeSingle(),
     batch.zone_id
       ? supabase.from('hub_location_zone').select('hub_location_id, hub_location, zone_id').eq('zone_id', batch.zone_id)
       : Promise.resolve({ data: [], error: null }),
-    supabase.from('sellers').select('seller_id, name, store_location_id'),
+    supabase.from('sellers').select('seller_id, name, store_location_id').eq('seller_id', input.sellerId).maybeSingle(),
     supabase.from('store_location_zone').select('store_location_id, store_location, zone_id'),
     batch.drone_id
       ? supabase.from('drones').select('drone_id, current_hub_id, status, last_known_location, last_seen_at').eq('drone_id', batch.drone_id).maybeSingle()
@@ -482,29 +495,30 @@ export async function fetchSellerBatchMap(batchId: number, client?: SupabaseClie
       : Promise.resolve({ data: null, error: null }),
   ]);
 
-  if (ordersResult.error) throw new Error(ordersResult.error.message);
+  if (orderResult.error) throw new Error(orderResult.error.message);
   if (hubLocationsResult.error) throw new Error(hubLocationsResult.error.message);
-  if (sellersResult.error) throw new Error(sellersResult.error.message);
+  if (sellerResult.error) throw new Error(sellerResult.error.message);
   if (storeLocationsResult.error) throw new Error(storeLocationsResult.error.message);
   if (droneResult.error) throw new Error(droneResult.error.message);
   if (zoneResult.error) throw new Error(zoneResult.error.message);
 
-  const sellers = new Map(((sellersResult.data ?? []) as Array<{ seller_id: number; name: string | null; store_location_id: number }>).map((seller) => [seller.seller_id, seller]));
+  const order = orderResult.data as { order_id: number; seller_id: number; drop_location: unknown; status: string | null } | null;
+  if (!order) return null;
+
+  const seller = sellerResult.data as { seller_id: number; name: string | null; store_location_id: number } | null;
   const storeLocations = new Map(((storeLocationsResult.data ?? []) as Array<{ store_location_id: number; store_location: unknown; zone_id: number }>).map((location) => [location.store_location_id, location]));
   const hubLocations = (hubLocationsResult.data ?? []) as Array<{ hub_location_id: number; hub_location: unknown; zone_id: number }>;
-  const route = ((ordersResult.data ?? []) as Array<{ order_id: number; seller_id: number; drop_location: unknown; status: string | null }>)
-    .map((order) => parsePoint(order.drop_location))
-    .filter((point): point is LatLngPoint => Boolean(point));
+  const destinationPoint = parsePoint(order.drop_location);
 
   const hubPoint = parsePoint(hubLocations[0]?.hub_location);
-  const sellerPoints = Array.from(sellers.values())
-    .map((seller) => parsePoint(storeLocations.get(seller.store_location_id)?.store_location))
-    .filter((point): point is LatLngPoint => Boolean(point));
+  const sellerPoint = seller ? parsePoint(storeLocations.get(seller.store_location_id)?.store_location) : null;
   const parsedZone = parseHexZoneBoundary((zoneResult.data as { boundary_coordinates_ref?: string } | null)?.boundary_coordinates_ref ?? null);
-  const zoneShape = parsedZone ?? deriveZoneShape([...route, ...sellerPoints, ...(hubPoint ? [hubPoint] : [])]);
+  const zoneShape = parsedZone ?? deriveZoneShape([...(destinationPoint ? [destinationPoint] : []), ...(sellerPoint ? [sellerPoint] : []), ...(hubPoint ? [hubPoint] : [])]);
 
   const droneRow = droneResult.data as { drone_id: number; current_hub_id: number | null; status: string | null; last_known_location: unknown; last_seen_at: string | null } | null;
   const dronePosition = parsePoint(droneRow?.last_known_location ?? null) ?? hubPoint;
+  const droneHeading = dronePosition && destinationPoint ? bearingBetweenDegrees(dronePosition, destinationPoint) : undefined;
+  const shopDistance = sellerPoint && destinationPoint ? Math.round(distanceBetweenMeters(sellerPoint, destinationPoint)) : null;
 
   const zoneSnapshot = parsedZone
     ? {
@@ -523,25 +537,62 @@ export async function fetchSellerBatchMap(batchId: number, client?: SupabaseClie
       : null;
 
   return {
-    batchId,
+    batchId: input.batchId,
     zone: zoneSnapshot,
-    route,
+    route: [],
+    segments: [
+      ...(sellerPoint && destinationPoint ? [{
+        id: `seller-${input.sellerId}-to-order-${input.orderId}`,
+        points: [sellerPoint, destinationPoint],
+        color: '#38bdf8',
+        weight: 4,
+        label: shopDistance !== null ? `${shopDistance} m` : undefined,
+        detail: 'Direct seller-to-drop distance',
+      }] : []),
+      ...(droneRow && dronePosition && destinationPoint ? [{
+        id: `drone-${droneRow?.drone_id ?? 'x'}-to-order-${input.orderId}`,
+        points: [dronePosition, destinationPoint],
+        color: '#8b5cf6',
+        weight: 3,
+        dashed: true,
+        detail: 'Live drone-to-drop direction',
+      }] : []),
+      ...(!droneRow && hubPoint && destinationPoint ? [{
+        id: `hub-to-order-${input.orderId}`,
+        points: [hubPoint, destinationPoint],
+        color: '#94a3b8',
+        weight: 3,
+        dashed: true,
+        detail: 'Hub-to-drop route preview',
+      }] : []),
+    ],
     markers: [
       ...(hubPoint ? [{ id: `hub-${batch.zone_id ?? 'x'}`, label: 'Hub', kind: 'hub' as const, color: '#38bdf8', position: hubPoint, detail: batch.zone_id ? `Zone ${batch.zone_id}` : undefined }] : []),
-      ...sellerPoints.map((point, index) => ({ id: `seller-${index}`, label: `Seller ${index + 1}`, kind: 'seller' as const, color: '#f59e0b', position: point })),
-      ...((ordersResult.data ?? []) as Array<{ order_id: number; seller_id: number; drop_location: unknown; status: string | null }>).map((order) => {
-        const point = parsePoint(order.drop_location);
-        if (!point) return null;
-        return {
-          id: `order-${order.order_id}`,
-          label: `ORD-${order.order_id}`,
-          kind: 'destination' as const,
-          color: '#22c55e',
-          position: point,
-          detail: normalizeStatus(order.status, 'pending'),
-        };
-      }).filter((marker): marker is NonNullable<typeof marker> => Boolean(marker)),
-      ...(dronePosition && droneRow ? [{ id: `drone-${droneRow.drone_id}`, label: `Drone #${droneRow.drone_id}`, kind: 'drone' as const, color: '#8b5cf6', position: dronePosition, detail: normalizeStatus(droneRow.status, 'unknown') }] : []),
+      ...(sellerPoint ? [{
+        id: `seller-${input.sellerId}`,
+        label: seller?.name?.trim() || `Seller #${input.sellerId}`,
+        kind: 'seller' as const,
+        color: '#f59e0b',
+        position: sellerPoint,
+        detail: 'Pickup origin',
+      }] : []),
+      ...(destinationPoint ? [{
+        id: `order-${order.order_id}`,
+        label: `ORD-${order.order_id}`,
+        kind: 'destination' as const,
+        color: '#22c55e',
+        position: destinationPoint,
+        detail: normalizeStatus(order.status, 'pending'),
+      }] : []),
+      ...(dronePosition && droneRow ? [{
+        id: `drone-${droneRow.drone_id}`,
+        label: `Drone #${droneRow.drone_id}`,
+        kind: 'drone' as const,
+        color: '#2563eb',
+        position: dronePosition,
+        detail: normalizeStatus(droneRow.status, 'unknown'),
+        rotationDegrees: droneHeading,
+      }] : []),
     ],
   };
 }

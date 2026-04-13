@@ -10,10 +10,11 @@ interface LocationPickerProps {
   zone?: { zoneId: number; label: string; center: LatLngPoint; radiusMeters: number; vertices?: LatLngPoint[] } | null;
   zones?: Array<{ zoneId: number; label: string; center: LatLngPoint; radiusMeters: number; vertices?: LatLngPoint[] }>;
   extraMarkers?: Array<{ id: string; label: string; position: LatLngPoint; color: string; detail?: string }>;
+  segments?: Array<{ id: string; points: LatLngPoint[]; color?: string; weight?: number; dashed?: boolean; label?: string; detail?: string }>;
   height?: number;
 }
 
-export function LocationPicker({ title, value, onChange, zone, zones, extraMarkers = [], height = 320 }: LocationPickerProps) {
+export function LocationPicker({ title, value, onChange, zone, zones, extraMarkers = [], segments = [], height = 320 }: LocationPickerProps) {
   const markers = [
     ...extraMarkers.map((marker) => ({ ...marker, kind: 'context' })),
     ...(value ? [{ id: 'selected-point', label: title, kind: 'selected', color: '#ef4444', position: value, detail: `${value.lat.toFixed(4)}, ${value.lng.toFixed(4)}` }] : []),
@@ -28,6 +29,7 @@ export function LocationPicker({ title, value, onChange, zone, zones, extraMarke
         center={value ?? mapZones[0]?.center ?? null}
         zones={mapZones.map((entry) => ({ zoneId: entry.zoneId, label: entry.label, center: entry.center, radiusMeters: entry.radiusMeters, vertices: entry.vertices }))}
         markers={markers}
+        segments={segments}
         height={height}
         onClick={onChange}
       />

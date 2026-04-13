@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { LocationPicker } from '@/components/maps/location-picker';
 import { useAuth } from '@/context/AuthContext';
 import { createDeliveryForSeller } from '@/lib/delivery-data';
+import { distanceBetweenMeters } from '@/lib/geo';
 import PaymentGateway from '@/components/PaymentGateway';
 
 type ParcelSize = 'small' | 'medium' | 'large';
@@ -36,6 +37,12 @@ export default function NewDeliveryPage() {
   const weightValue = Number(weight);
   const parcelSize = getParcelSize(weightValue);
   const cost = parcelSize ? estimateCost(weightValue) : 0;
+  const destinationPoint = destinationLat && destinationLng
+    ? { lat: Number(destinationLat), lng: Number(destinationLng) }
+    : null;
+  const shopToDropDistance = user?.shopLocation && destinationPoint
+    ? Math.round(distanceBetweenMeters(user.shopLocation, destinationPoint))
+    : null;
 
   const canProceed = parcelSize && destinationLat && destinationLng && user?.sellerId && user?.zoneId;
 
@@ -159,14 +166,29 @@ export default function NewDeliveryPage() {
 
               <LocationPicker
                 title="Select drop-off point"
-                value={destinationLat && destinationLng ? { lat: Number(destinationLat), lng: Number(destinationLng) } : null}
+                value={destinationPoint}
                 onChange={(point) => {
                   setDestinationLat(point.lat.toFixed(6));
                   setDestinationLng(point.lng.toFixed(6));
                 }}
                 extraMarkers={user?.shopLocation ? [{ id: 'seller-shop', label: 'Your shop', position: user.shopLocation, color: '#f59e0b' }] : []}
+                segments={user?.shopLocation && destinationPoint ? [{
+                  id: 'shop-to-drop',
+                  points: [user.shopLocation, destinationPoint],
+                  color: '#38bdf8',
+                  weight: 4,
+                  label: `${shopToDropDistance ?? 0} m`,
+                  detail: 'Direct shop-to-drop distance',
+                }] : []}
                 height={300}
               />
+
+              {shopToDropDistance !== null ? (
+                <div className="mt-3 inline-flex items-center gap-2 rounded-lg border border-sky-500/20 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-200">
+                  <span className="h-2 w-2 rounded-full bg-sky-400" />
+                  Direct distance from shop: {shopToDropDistance} meters
+                </div>
+              ) : null}
             </div>
 
             {/* Section: Package Details */}
@@ -245,6 +267,10 @@ export default function NewDeliveryPage() {
                 <div className="flex justify-between items-center px-5 py-3 border-b border-slate-800/30">
                   <span className="text-sm text-slate-400">Delivery zone</span>
                   <span className="text-sm font-medium text-slate-200">{user?.zoneLabel ?? '—'}</span>
+                </div>
+                <div className="flex justify-between items-center px-5 py-3 border-b border-slate-800/30">
+                  <span className="text-sm text-slate-400">Shop to drop</span>
+                  <span className="text-sm font-medium text-slate-200">{shopToDropDistance !== null ? `${shopToDropDistance} m` : '—'}</span>
                 </div>
                 <div className="flex justify-between items-center px-5 py-4 bg-slate-800/20">
                   <span className="text-sm font-semibold text-slate-300">Total</span>

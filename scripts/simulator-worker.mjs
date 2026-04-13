@@ -6,7 +6,8 @@ import { Resend } from 'resend';
 
 const ROOT = process.cwd();
 const ENV_PATH = path.join(ROOT, '.env.local');
-const TICK_MS = Number(process.env.SIMULATOR_TICK_MS || 15000);
+const TICK_MS = Number(process.env.SIMULATOR_TICK_MS || 3000);
+const STEP_DISTANCE_METERS = Number(process.env.SIMULATOR_STEP_METERS || 100);
 const RUN_ONCE = process.argv.includes('--once');
 
 function loadEnvFile(filePath) {
@@ -147,8 +148,41 @@ function parsePoint(point) {
 
   if (typeof point === 'string') {
     const match = point.match(/POINT\s*\(\s*([-\d.]+)\s+([-\d.]+)\s*\)/i);
-    if (!match) return null;
-    return { lng: Number(match[1]), lat: Number(match[2]) };
+    if (match) {
+      return { lng: Number(match[1]), lat: Number(match[2]) };
+    }
+
+    if (/^[\da-f]+$/i.test(point.trim()) && point.trim().length >= 42 && point.trim().length % 2 === 0) {
+      const trimmed = point.trim();
+      const bytes = new Uint8Array(trimmed.length / 2);
+      for (let index = 0; index < trimmed.length; index += 2) {
+        const value = Number.parseInt(trimmed.slice(index, index + 2), 16);
+        if (Number.isNaN(value)) return null;
+        bytes[index / 2] = value;
+      }
+
+      const view = new DataView(bytes.buffer);
+      const littleEndian = view.getUint8(0) === 1;
+      let offset = 1;
+      let geometryType = view.getUint32(offset, littleEndian);
+      offset += 4;
+
+      if ((geometryType & 0x20000000) !== 0) {
+        if (bytes.byteLength < offset + 4) return null;
+        offset += 4;
+        geometryType &= ~0x20000000;
+      }
+
+      if (geometryType % 1000 !== 1 || bytes.byteLength < offset + 16) return null;
+
+      const lng = view.getFloat64(offset, littleEndian);
+      const lat = view.getFloat64(offset + 8, littleEndian);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+
+      return { lng, lat };
+    }
+
+    return null;
   }
 
   if (typeof point === 'object') {
@@ -170,15 +204,78 @@ function toPointValue(point) {
   return `SRID=4326;POINT(${point.lng} ${point.lat})`;
 }
 
-function distanceSq(a, b) {
-  return ((a.lat - b.lat) ** 2) + ((a.lng - b.lng) ** 2);
+function distanceBetweenMeters(a, b) {
+  const toRadians = (value) => (value * Math.PI) / 180;
+  const earthRadius = 6371000;
+  const dLat = toRadians(b.lat - a.lat);
+  const dLng = toRadians(b.lng - a.lng);
+  const startLat = toRadians(a.lat);
+  const endLat = toRadians(b.lat);
+
+  const haversine =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2)
+    + Math.cos(startLat) * Math.cos(endLat) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+
+  return 2 * earthRadius * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
 }
 
-function interpolatePoint(a, b, ratio) {
-  const clamped = Math.max(0, Math.min(1, ratio));
+function bearingBetweenDegrees(from, to) {
+  const lat1 = (from.lat * Math.PI) / 180;
+  const lat2 = (to.lat * Math.PI) / 180;
+  const dLng = ((to.lng - from.lng) * Math.PI) / 180;
+
+  const y = Math.sin(dLng) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2)
+    - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
+function destinationPoint(origin, bearingDegrees, distanceMeters) {
+  const earthRadius = 6371000;
+  const bearing = (bearingDegrees * Math.PI) / 180;
+  const lat1 = (origin.lat * Math.PI) / 180;
+  const lng1 = (origin.lng * Math.PI) / 180;
+  const angularDistance = distanceMeters / earthRadius;
+
+  const lat2 = Math.asin(
+    Math.sin(lat1) * Math.cos(angularDistance)
+    + Math.cos(lat1) * Math.sin(angularDistance) * Math.cos(bearing)
+  );
+
+  const lng2 = lng1 + Math.atan2(
+    Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(lat1),
+    Math.cos(angularDistance) - Math.sin(lat1) * Math.sin(lat2)
+  );
+
   return {
-    lat: a.lat + (b.lat - a.lat) * clamped,
-    lng: a.lng + (b.lng - a.lng) * clamped,
+    lat: (lat2 * 180) / Math.PI,
+    lng: ((lng2 * 180) / Math.PI + 540) % 360 - 180,
+  };
+}
+
+function moveTowardsPoint(from, to, distanceMeters) {
+  const totalDistance = distanceBetweenMeters(from, to);
+  if (totalDistance <= Number.EPSILON) {
+    return {
+      point: to,
+      traveledMeters: 0,
+      reached: true,
+    };
+  }
+
+  if (distanceMeters >= totalDistance) {
+    return {
+      point: to,
+      traveledMeters: totalDistance,
+      reached: true,
+    };
+  }
+
+  return {
+    point: destinationPoint(from, bearingBetweenDegrees(from, to), distanceMeters),
+    traveledMeters: distanceMeters,
+    reached: false,
   };
 }
 
@@ -215,7 +312,7 @@ function findNearestHub(point, hubs) {
   for (const hub of hubs) {
     const hubPoint = parsePoint(hub.hub_location);
     if (!hubPoint) continue;
-    const d = distanceSq(point, hubPoint);
+    const d = distanceBetweenMeters(point, hubPoint);
     if (d < bestDistance) {
       bestDistance = d;
       best = hub;
@@ -367,37 +464,45 @@ async function startBatch(batch, dronesById, ordersByBatch, sellersById) {
   return true;
 }
 
-async function setStopEnRoute(stop, batch, dronesById, hubsByZone, ordersById) {
-  const timestamp = nowIso();
-  const drone = batch.drone_id ? dronesById.get(batch.drone_id) ?? null : null;
+function getStopTargetPoint(stop, ordersById) {
   const order = stop.order_id ? ordersById.get(stop.order_id) ?? null : null;
-  const targetPoint = parsePoint(stop.location) ?? parsePoint(order?.drop_location ?? null);
-  if (!targetPoint) return;
+  return parsePoint(stop.location) ?? parsePoint(order?.drop_location ?? null);
+}
 
-  const zoneHub = getBatchHub(batch, hubsByZone);
-  const hubPoint = getHubPoint(zoneHub);
-  const originPoint = parsePoint(drone?.last_known_location) ?? hubPoint ?? targetPoint;
-  const travelPoint = interpolatePoint(originPoint, targetPoint, 0.55);
+function getDronePointForBatch(batch, dronesById, hubsByZone) {
+  if (!batch.drone_id) return getHubPoint(getBatchHub(batch, hubsByZone));
+  const drone = dronesById.get(batch.drone_id) ?? null;
+  return parsePoint(drone?.last_known_location) ?? getHubPoint(getBatchHub(batch, hubsByZone));
+}
 
+function syncDroneCache(drone, position, status, timestamp, currentHubId) {
+  if (!drone) return;
+  if (position) drone.last_known_location = toPointValue(position);
+  if (status) drone.status = status;
+  if (timestamp) drone.last_seen_at = timestamp;
+  if (currentHubId) drone.current_hub_id = currentHubId;
+}
+
+async function updateDroneProgress(batch, dronesById, position, status, note, stopId = null, currentHubId = null) {
+  if (!batch.drone_id || !position) return;
+  const timestamp = nowIso();
+  await updateDroneState(batch.drone_id, {
+    status,
+    last_known_location: position,
+    last_seen_at: timestamp,
+    ...(currentHubId ? { current_hub_id: currentHubId } : {}),
+  });
+  if (note) await recordTrackingPoint(batch.batch_id, stopId, position, note);
+  syncDroneCache(dronesById.get(batch.drone_id) ?? null, position, status, timestamp, currentHubId);
+}
+
+async function setStopEnRoute(stop, batch) {
+  if ((stop.status ?? '').toLowerCase() === 'en_route') return;
+  const timestamp = nowIso();
   const { error: stopError } = await supabase.from('batch_stops').update({ status: 'en_route', eta_at: timestamp }).eq('stop_id', stop.stop_id);
   if (stopError) throw stopError;
-
-  if (batch.drone_id) {
-    await updateDroneState(batch.drone_id, {
-      status: 'en_route',
-      last_known_location: travelPoint,
-      last_seen_at: timestamp,
-    });
-    await recordTrackingPoint(batch.batch_id, stop.stop_id, travelPoint, `Heading to stop ${stop.sequence_no}`);
-    const currentDrone = dronesById.get(batch.drone_id);
-    if (currentDrone) {
-      currentDrone.last_known_location = toPointValue(travelPoint);
-      currentDrone.last_seen_at = timestamp;
-      currentDrone.status = 'en_route';
-    }
-  }
-
   stop.status = 'en_route';
+  stop.eta_at = timestamp;
   console.log(`[travel] Batch #${batch.batch_id} heading to stop ${stop.sequence_no}.`);
 }
 
@@ -427,44 +532,24 @@ async function finalizeBatch(batch, finalPoint, hubsByZone, allBatches, dronesBy
 
     const drone = dronesById.get(batch.drone_id);
     if (drone) {
-      drone.last_known_location = returnPoint ? toPointValue(returnPoint) : drone.last_known_location;
-      drone.last_seen_at = timestamp;
-      drone.status = droneStillBusy ? 'en_route' : 'available';
-      if (returnHub && !droneStillBusy) drone.current_hub_id = returnHub.hub_id;
+      syncDroneCache(drone, returnPoint, droneStillBusy ? 'en_route' : 'available', timestamp, returnHub && !droneStillBusy ? returnHub.hub_id : null);
     }
   }
 
   batch.status = 'completed';
   batch.completed_at = timestamp;
-  console.log(`[complete] Batch #${batch.batch_id} finished.${returnHub ? ` Drone returns to Hub #${returnHub.hub_id}.` : ''}`);
+  console.log(`[complete] Batch #${batch.batch_id} finished.${returnHub ? ` Drone reached Hub #${returnHub.hub_id}.` : ''}`);
 }
 
-async function completeStopOrBatch(batch, stopsByBatch, ordersById, ordersByBatch, hubsByZone, allBatches, dronesById, sellersById) {
-  const pendingStops = getPendingStops(batch.batch_id, stopsByBatch);
-  if (pendingStops.length === 0) {
-    const lastDeliveredPoint = getBatchOrders(batch.batch_id, ordersByBatch)
-      .map((order) => parsePoint(order.drop_location))
-      .filter(Boolean)
-      .at(-1) ?? null;
-    await finalizeBatch(batch, lastDeliveredPoint, hubsByZone, allBatches, dronesById);
-    return;
-  }
-
-  const activeStop = pendingStops.find((stop) => (stop.status ?? '').toLowerCase() === 'en_route') ?? pendingStops[0];
-  if ((activeStop.status ?? '').toLowerCase() !== 'en_route') {
-    await setStopEnRoute(activeStop, batch, dronesById, hubsByZone, ordersById);
-    return;
-  }
-
+async function completeStop(batch, stop, destinationPoint, sellersById, dronesById, ordersById) {
   const timestamp = nowIso();
-  const deliveredOrder = activeStop.order_id ? ordersById.get(activeStop.order_id) ?? null : null;
-  const destinationPoint = parsePoint(activeStop.location) ?? parsePoint(deliveredOrder?.drop_location ?? null);
+  const deliveredOrder = stop.order_id ? ordersById.get(stop.order_id) ?? null : null;
 
-  const { error: stopError } = await supabase.from('batch_stops').update({ status: 'completed', arrived_at: timestamp, completed_at: timestamp }).eq('stop_id', activeStop.stop_id);
+  const { error: stopError } = await supabase.from('batch_stops').update({ status: 'completed', arrived_at: timestamp, completed_at: timestamp }).eq('stop_id', stop.stop_id);
   if (stopError) throw stopError;
 
-  if (activeStop.order_id) {
-    const { error: orderError } = await supabase.from('orders').update({ status: 'delivered', delivered_at: timestamp, updated_at: timestamp }).eq('order_id', activeStop.order_id);
+  if (stop.order_id) {
+    const { error: orderError } = await supabase.from('orders').update({ status: 'delivered', delivered_at: timestamp, updated_at: timestamp }).eq('order_id', stop.order_id);
     if (orderError) throw orderError;
     if (deliveredOrder) {
       deliveredOrder.status = 'delivered';
@@ -476,32 +561,93 @@ async function completeStopOrBatch(batch, stopsByBatch, ordersById, ordersByBatc
     if (deliveredOrder && sellersById) {
       const seller = sellersById.get(deliveredOrder.seller_id);
       if (seller?.email) {
-        notifyDeliveryComplete(seller.email, seller.name || `Seller #${seller.seller_id}`, activeStop.order_id, batch.batch_id, batch.drone_id || 0)
+        notifyDeliveryComplete(seller.email, seller.name || `Seller #${seller.seller_id}`, stop.order_id, batch.batch_id, batch.drone_id || 0)
           .catch((e) => console.error('[email] delivery-complete bg error:', e.message));
       }
     }
   }
 
-  if (batch.drone_id) {
-    await updateDroneState(batch.drone_id, {
-      status: 'en_route',
-      last_known_location: destinationPoint,
-      last_seen_at: timestamp,
-    });
-    if (destinationPoint) await recordTrackingPoint(batch.batch_id, activeStop.stop_id, destinationPoint, `Completed stop ${activeStop.sequence_no}`);
-    const drone = dronesById.get(batch.drone_id);
-    if (drone) {
-      drone.last_known_location = destinationPoint ? toPointValue(destinationPoint) : drone.last_known_location;
-      drone.last_seen_at = timestamp;
-    }
+  if (destinationPoint) {
+    await updateDroneProgress(batch, dronesById, destinationPoint, 'en_route', `Completed stop ${stop.sequence_no}`, stop.stop_id);
   }
 
-  activeStop.status = 'completed';
-  console.log(`[progress] Batch #${batch.batch_id} completed stop ${activeStop.sequence_no}.`);
+  stop.status = 'completed';
+  stop.arrived_at = timestamp;
+  stop.completed_at = timestamp;
+  console.log(`[delivery] Batch #${batch.batch_id} completed stop ${stop.sequence_no}.`);
+}
 
-  const remaining = getPendingStops(batch.batch_id, stopsByBatch).filter((stop) => stop.stop_id !== activeStop.stop_id);
-  if (remaining.length === 0) {
-    await finalizeBatch(batch, destinationPoint, hubsByZone, allBatches, dronesById);
+async function advanceBatchAlongRoute(batch, stopsByBatch, ordersById, ordersByBatch, hubsByZone, allBatches, dronesById, sellersById) {
+  let currentPoint = getDronePointForBatch(batch, dronesById, hubsByZone);
+  if (!currentPoint) {
+    const lastDeliveredPoint = getBatchOrders(batch.batch_id, ordersByBatch)
+      .map((order) => parsePoint(order.drop_location))
+      .filter(Boolean)
+      .at(-1) ?? null;
+    await finalizeBatch(batch, lastDeliveredPoint, hubsByZone, allBatches, dronesById);
+    return;
+  }
+
+  let remainingMeters = STEP_DISTANCE_METERS;
+  while (remainingMeters > 0.01) {
+    const pendingStops = getPendingStops(batch.batch_id, stopsByBatch);
+    if (pendingStops.length === 0) {
+      const zoneHubs = hubsByZone.get(batch.zone_id) ?? [];
+      const returnHub = findNearestHub(currentPoint, zoneHubs) ?? zoneHubs[0] ?? null;
+      const returnPoint = getHubPoint(returnHub);
+      if (!returnPoint) {
+        await finalizeBatch(batch, currentPoint, hubsByZone, allBatches, dronesById);
+        return;
+      }
+
+      const step = moveTowardsPoint(currentPoint, returnPoint, remainingMeters);
+      currentPoint = step.point;
+      remainingMeters = Math.max(0, remainingMeters - step.traveledMeters);
+
+      if (step.reached) {
+        await finalizeBatch(batch, returnPoint, hubsByZone, allBatches, dronesById);
+        return;
+      }
+
+      const remainingToHub = Math.max(0, Math.round(distanceBetweenMeters(currentPoint, returnPoint)));
+      await updateDroneProgress(
+        batch,
+        dronesById,
+        currentPoint,
+        'returning',
+        `Returning to Hub #${returnHub?.hub_id ?? '—'} · ${remainingToHub}m left`
+      );
+      break;
+    }
+
+    const activeStop = pendingStops.find((stop) => (stop.status ?? '').toLowerCase() === 'en_route') ?? pendingStops[0];
+    const targetPoint = getStopTargetPoint(activeStop, ordersById);
+    if (!targetPoint) {
+      console.warn(`[travel] Missing coordinates for stop ${activeStop.stop_id} in Batch #${batch.batch_id}.`);
+      break;
+    }
+
+    await setStopEnRoute(activeStop, batch);
+
+    const step = moveTowardsPoint(currentPoint, targetPoint, remainingMeters);
+    currentPoint = step.point;
+    remainingMeters = Math.max(0, remainingMeters - step.traveledMeters);
+
+    if (step.reached) {
+      await completeStop(batch, activeStop, targetPoint, sellersById, dronesById, ordersById);
+      continue;
+    }
+
+    const remainingToStop = Math.max(0, Math.round(distanceBetweenMeters(currentPoint, targetPoint)));
+    await updateDroneProgress(
+      batch,
+      dronesById,
+      currentPoint,
+      'en_route',
+      `Heading to stop ${activeStop.sequence_no} · ${remainingToStop}m left`,
+      activeStop.stop_id
+    );
+    break;
   }
 }
 
@@ -548,7 +694,6 @@ async function tick() {
 
   const dronesById = new Map(drones.map((drone) => [drone.drone_id, drone]));
   const sellersById = new Map(sellers.map((seller) => [seller.seller_id, seller]));
-  const startedThisTick = new Set();
 
   for (const batch of batches) {
     await ensureBatchStops(batch, ordersByBatch, stopsByBatch);
@@ -599,26 +744,35 @@ async function tick() {
       await finalizeBatch(batch, lastPoint, hubsByZone, batches, dronesById);
       continue;
     }
-    if (await startBatch(batch, dronesById, ordersByBatch, sellersById)) startedThisTick.add(batch.batch_id);
+    await startBatch(batch, dronesById, ordersByBatch, sellersById);
   }
 
-  for (const batch of batches.filter((item) => item.status === 'in_progress' && !startedThisTick.has(item.batch_id))) {
-    await completeStopOrBatch(batch, stopsByBatch, ordersById, ordersByBatch, hubsByZone, batches, dronesById, sellersById);
+  for (const batch of batches.filter((item) => item.status === 'in_progress')) {
+    await advanceBatchAlongRoute(batch, stopsByBatch, ordersById, ordersByBatch, hubsByZone, batches, dronesById, sellersById);
   }
 }
 
 async function main() {
+  console.log(`[simulator] starting worker with ${TICK_MS}ms ticks and ${STEP_DISTANCE_METERS}m movement steps.`);
+
   if (RUN_ONCE) {
     await tick();
     return;
   }
 
-  await tick();
-  setInterval(() => {
-    tick().catch((error) => {
+  while (true) {
+    const tickStartedAt = Date.now();
+
+    await tick().catch((error) => {
       console.error('[simulator] tick failed:', error.message);
     });
-  }, TICK_MS);
+
+    const elapsedMs = Date.now() - tickStartedAt;
+    const delayMs = Math.max(0, TICK_MS - elapsedMs);
+    if (delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
 }
 
 main().catch((error) => {

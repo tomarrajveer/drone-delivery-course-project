@@ -21,13 +21,52 @@ export function toPointValue(lat: number, lng: number) {
   return `SRID=4326;POINT(${lng} ${lat})`;
 }
 
+function parseHexEncodedPoint(point: string): LatLngPoint | null {
+  const trimmed = point.trim();
+  if (!/^[\da-f]+$/i.test(trimmed) || trimmed.length < 42 || trimmed.length % 2 !== 0) {
+    return null;
+  }
+
+  const bytes = new Uint8Array(trimmed.length / 2);
+  for (let index = 0; index < trimmed.length; index += 2) {
+    const value = Number.parseInt(trimmed.slice(index, index + 2), 16);
+    if (Number.isNaN(value)) return null;
+    bytes[index / 2] = value;
+  }
+
+  const view = new DataView(bytes.buffer);
+  const littleEndian = view.getUint8(0) === 1;
+  let offset = 1;
+  let geometryType = view.getUint32(offset, littleEndian);
+  offset += 4;
+
+  if ((geometryType & 0x20000000) !== 0) {
+    if (bytes.byteLength < offset + 4) return null;
+    offset += 4;
+    geometryType &= ~0x20000000;
+  }
+
+  if (geometryType % 1000 !== 1 || bytes.byteLength < offset + 16) {
+    return null;
+  }
+
+  const lng = view.getFloat64(offset, littleEndian);
+  const lat = view.getFloat64(offset + 8, littleEndian);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+
+  return { lng, lat };
+}
+
 export function parsePoint(point: unknown): LatLngPoint | null {
   if (!point) return null;
 
   if (typeof point === 'string') {
     const match = point.match(/POINT\s*\(\s*([-\d.]+)\s+([-\d.]+)\s*\)/i);
-    if (!match) return null;
-    return { lng: Number(match[1]), lat: Number(match[2]) };
+    if (match) {
+      return { lng: Number(match[1]), lat: Number(match[2]) };
+    }
+
+    return parseHexEncodedPoint(point);
   }
 
   if (typeof point === 'object' && point !== null) {
@@ -78,6 +117,18 @@ export function midpoint(a: LatLngPoint, b: LatLngPoint): LatLngPoint {
   };
 }
 
+export function bearingBetweenDegrees(from: LatLngPoint, to: LatLngPoint) {
+  const lat1 = (from.lat * Math.PI) / 180;
+  const lat2 = (to.lat * Math.PI) / 180;
+  const dLng = ((to.lng - from.lng) * Math.PI) / 180;
+
+  const y = Math.sin(dLng) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2)
+    - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
 export function interpolatePoint(a: LatLngPoint, b: LatLngPoint, ratio: number): LatLngPoint {
   const clamped = Math.max(0, Math.min(1, ratio));
   return {
@@ -123,6 +174,35 @@ function destinationPoint(origin: LatLngPoint, bearingDegrees: number, distanceM
 
 export function createHexagon(center: LatLngPoint, radiusMeters: number): LatLngPoint[] {
   return Array.from({ length: 6 }, (_, index) => destinationPoint(center, 60 * index - 30, radiusMeters));
+}
+
+export function moveTowardsPoint(from: LatLngPoint, to: LatLngPoint, distanceMeters: number) {
+  const totalDistance = distanceBetweenMeters(from, to);
+  if (totalDistance <= Number.EPSILON) {
+    return {
+      point: to,
+      traveledMeters: 0,
+      reached: true,
+      remainingMeters: 0,
+    };
+  }
+
+  if (distanceMeters >= totalDistance) {
+    return {
+      point: to,
+      traveledMeters: totalDistance,
+      reached: true,
+      remainingMeters: 0,
+    };
+  }
+
+  const ratio = distanceMeters / totalDistance;
+  return {
+    point: interpolatePoint(from, to, ratio),
+    traveledMeters: distanceMeters,
+    reached: false,
+    remainingMeters: totalDistance - distanceMeters,
+  };
 }
 
 export function pointInPolygon(point: LatLngPoint, polygon: LatLngPoint[]) {

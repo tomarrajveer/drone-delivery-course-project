@@ -22,9 +22,9 @@ Instead of building a full real-time fleet backend, the worker uses a simple per
 1. closes expired collection windows
 2. assigns an available drone
 3. launches the batch
-4. completes one stop per tick
-5. marks orders delivered
-6. returns the drone to the nearest hub after the final stop
+4. moves each active drone forward in short distance steps
+5. marks orders delivered only when the drone actually reaches that stop
+6. keeps animating the return-to-hub leg after the final delivery
 
 That keeps it demo-friendly and understandable, which is the right call for this course project.
 
@@ -44,7 +44,16 @@ The loop interval is controlled by:
 - `SIMULATOR_TICK_MS`
 
 Default:
-- `15000` ms (15 seconds)
+- `3000` ms (3 seconds)
+
+The worker reads `.env.local` on startup, so any later code change to the worker loop does nothing until you restart the running `npm run sim:worker` process.
+
+### Movement step size
+The travel distance per tick is controlled by:
+- `SIMULATOR_STEP_METERS`
+
+Default:
+- `100` meters per tick
 
 ### Supabase client
 The script creates a service-role Supabase client with session persistence disabled because this is a backend worker, not a user session.
@@ -124,21 +133,28 @@ This is handled by `assignDrone(batch, drones, hubZones)` followed by `startBatc
 For every batch in:
 - `in_progress`
 
-the worker completes exactly one pending stop per tick.
+the worker moves the drone up to 100 meters along its current route on each tick.
 
-### Stop completion behavior
-It sorts batch stops by `sequence_no`, finds the first stop not yet completed, and:
-- marks that stop as `completed`
-- if the stop belongs to an order, marks the order as `delivered`
+### Movement behavior
+It sorts batch stops by `sequence_no`, finds the first pending stop, and moves the drone toward that stop.
 
-If more stops remain, the batch stays in progress.
+If the next 100 meter step would overshoot the stop:
+- the drone snaps to that stop
+- the stop is marked `completed`
+- the related order is marked `delivered`
+- any remaining distance from that same tick is immediately applied to the next leg
 
-If that was the last stop, the batch is completed.
-
-This is handled by `completeOneStop(...)`.
+That means a short stop can be reached and delivered in the middle of a tick, and the drone can continue moving toward the next stop or the return hub without waiting for another whole cycle.
 
 ## End-of-batch return logic
-When the final stop is completed, the worker does two things:
+When the final stop is completed, the worker does not teleport the drone home anymore.
+
+Instead it:
+- keeps the batch in `in_progress`
+- changes the drone to `returning`
+- moves the drone 100 meters per tick toward the nearest hub in that zone
+
+Only when the drone actually reaches that hub does it do two final things:
 
 ### 1. Complete the batch
 Batch status becomes:
@@ -176,34 +192,23 @@ That makes the worker less brittle against the project’s not-perfectly-clean l
 This worker is deliberately simple. That is not a bug; it is scope control.
 
 ### What it does not do yet
-- no continuous coordinate-by-coordinate drone movement
-- no persisted breadcrumb trail
-- no ETA calculation
-- no route optimization / TSP
+- no advanced route optimization / TSP
 - no battery simulation
 - no charging logic
 - no failure/retry handling beyond basic script errors
 - no websocket push layer
 
-### What “movement” means right now
-Movement is state progression, not true telemetry.
+### What it does do now
+- continuous short-step movement suitable for live polling maps
+- per-tick persisted drone positions through `drones.last_known_location`
+- tracking-point inserts while the drone moves
+- animated return-to-hub movement instead of instant return
 
-In other words:
-- the worker advances batches and stops over time
-- the UI can poll and show delivery progress
-- but the worker does not currently write a stream of drone GPS positions
-
-## Why one-stop-per-tick was chosen
-
-Because it’s the cleanest honest tradeoff.
-
-For a college demo, one-stop-per-tick gives you:
-- visible progress over time
-- understandable logic
-- easy debugging
-- less fake sophistication
-
-It avoids wasting time on elaborate movement simulation before the rest of the system is stable.
+### What is still simplified
+- no ETA calculation
+- movement is still straight-line and fixed-step, not a real routing engine
+- stops still use simple running order
+- there is no physics, weather, or battery model
 
 ## Error handling
 
@@ -222,6 +227,12 @@ It logs messages like:
 - progress
 - complete
 - simulator tick failure
+- startup configuration (`tick` / `step`) so the active runtime is visible in the terminal
+
+## Runtime notes
+
+- Supabase/PostGIS may return geography points as EWKB hex strings instead of `POINT(lng lat)` text. The worker and frontend both need to parse that format correctly or the drone appears stuck on the fallback hub marker even while deliveries progress in the database.
+- The worker loop now runs sequentially instead of using raw `setInterval`, so one slow tick cannot overlap the next and accidentally advance the same batch twice.
 
 ## Typical lifecycle example
 
@@ -232,12 +243,12 @@ A normal batch flows like this:
 3. worker marks batch `ready`
 4. worker assigns an available drone
 5. worker starts batch -> `in_progress`
-6. first stop completes on one tick
-7. second stop completes on the next tick
-8. final stop completes on the last tick
-9. related orders become `delivered`
-10. batch becomes `completed`
-11. drone returns to the nearest hub and becomes `available`
+6. every 3 seconds the drone advances 100 meters toward the next stop
+7. when a stop is reached, that order becomes `delivered`
+8. after the final delivery, the drone starts the return leg toward the nearest hub
+9. every 3 seconds the return leg also advances 100 meters
+10. once the hub is reached, the batch becomes `completed`
+11. the drone becomes `available`
 
 ## How to run it
 
